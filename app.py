@@ -202,28 +202,40 @@ function downloadJPK() {
 def index():
     return render_template_string(HTML_TEMPLATE)
 
-@app.route('/api/fetch-ksef', methods=['POST'])
+@app.route("/api/fetch-ksef", methods=["POST"])
 def fetch_ksef():
     data = request.json
-    nip = data.get('nip', '').strip()
-    token = data.get('token', '').strip()
-    env = data.get('env', 'test')
+    nip = data.get("nip", "").strip()
+    token = data.get("token", "").strip()
+    env = data.get("env", "test")
 
-    base_url = "https://ksef-test.mf.gov.pl/api/online" if env == "test" else "https://ksef.mf.gov.pl/api/online"
+    base_url = (
+        "https://ksef-test.mf.gov.pl/api/online"
+        if env == "test"
+        else "https://ksef.mf.gov.pl/api/online"
+    )
 
     try:
-        # 1. Pobranie klucza publicznego KSeF jeśli środowisko produkcyjne
-        if env == "prod":
-            pubkey_res = requests.get(f"{base_url}/Security/PublicKey")
-            pubkey_res.raise_for_status()
-            pem_key = pubkey_res.content.decode('utf-8')
+        # 1. DYNAMICZNE POBRANIE AKTUALNEGO KLUCZA PUBLICZNEGO KSEF
+        pubkey_res = requests.get(
+            f"{base_url}/Security/PublicKey",
+            headers={"Accept": "application/json"},
+        )
+        pubkey_res.raise_for_status()
+
+        # Odczytujemy klucz z odpowiedzi API KSeF
+        pubkey_data = pubkey_res.json()
+        if isinstance(pubkey_data, dict) and "publicKey" in pubkey_data:
+            pem_key = pubkey_data["publicKey"]
         else:
-            pem_key = KSEF_TEST_PUBKEY
+            pem_key = pubkey_res.text
 
         # 2. Szyfrowanie tokena z aktualnym timestampem UTC
-        timestamp_ms = int(datetime.datetime.now(datetime.timezone.utc).timestamp() * 1000)
-        msg = f"{token}|{timestamp_ms}".encode('utf-8')
-        pub_key = load_pem_public_key(pem_key.encode('utf-8'))
+        timestamp_ms = int(
+            datetime.datetime.now(datetime.timezone.utc).timestamp() * 1000
+        )
+        msg = f"{token}|{timestamp_ms}".encode("utf-8")
+        pub_key = load_pem_public_key(pem_key.encode("utf-8"))
 
         encrypted_token = base64.b64encode(
             pub_key.encrypt(
@@ -231,38 +243,49 @@ def fetch_ksef():
                 padding.OAEP(
                     mgf=padding.MGF1(algorithm=hashes.SHA256()),
                     algorithm=hashes.SHA256(),
-                    label=None
-                )
+                    label=None,
+                ),
             )
-        ).decode('utf-8')
+        ).decode("utf-8")
 
-        # 3. Nawiązanie sesji
+        # 3. Nawiązanie sesji w KSeF
         init_res = requests.post(
             f"{base_url}/Session/InitToken",
             headers={
                 "Content-Type": "application/json",
-                "Accept": "application/json"
+                "Accept": "application/json",
             },
             json={
                 "context": {
                     "contextIdentifier": {"type": "onip", "identifier": nip},
                     "dimensions": [],
-                    "token": encrypted_token
+                    "token": encrypted_token,
                 }
-            }
+            },
         )
 
-        if init_res.status_code != 201 and init_res.status_code != 200:
-            return jsonify({
-                "error": f"Błąd autoryzacji w KSeF (HTTP {init_res.status_code})",
-                "details": init_res.json() if init_res.content else init_res.text
-            }), 400
+        if init_res.status_code not in (200, 201):
+            return (
+                jsonify(
+                    {
+                        "error": f"Błąd autoryzacji w KSeF (HTTP {init_res.status_code})",
+                        "details": (
+                            init_res.json()
+                            if init_res.content
+                            else init_res.text
+                        ),
+                    }
+                ),
+                400,
+            )
 
-        sess_token = init_res.json()['sessionToken']['token']
+        sess_token = init_res.json()["sessionToken"]["token"]
 
-        # 4. Zapytanie o listę faktur z ostatnich 30 dni
+        # 4. Zapytanie o listę faktur zakupowych z ostatnich 30 dni
         now = datetime.datetime.now(datetime.timezone.utc)
-        from_date = (now - datetime.timedelta(days=30)).strftime("%Y-%m-%dT00:00:00")
+        from_date = (now - datetime.timedelta(days=30)).strftime(
+            "%Y-%m-%dT00:00:00"
+        )
         to_date = now.strftime("%Y-%m-%dT23:59:59")
 
         query_res = requests.post(
@@ -270,61 +293,93 @@ def fetch_ksef():
             headers={
                 "SessionToken": sess_token,
                 "Content-Type": "application/json",
-                "Accept": "application/json"
+                "Accept": "application/json",
             },
             json={
                 "queryCriteria": {
                     "subjectType": "subject2",
                     "type": "range",
                     "invoicingDateFrom": from_date,
-                    "invoicingDateTo": to_date
+                    "invoicingDateTo": to_date,
                 }
-            }
+            },
         )
 
         if query_res.status_code != 200:
-            return jsonify({
-                "error": f"Błąd pobierania listy faktur (HTTP {query_res.status_code})",
-                "details": query_res.json() if query_res.content else query_res.text
-            }), 400
+            return (
+                jsonify(
+                    {
+                        "error": f"Błąd pobierania listy faktur (HTTP {query_res.status_code})",
+                        "details": (
+                            query_res.json()
+                            if query_res.content
+                            else query_res.text
+                        ),
+                    }
+                ),
+                400,
+            )
 
-        raw_invoices = query_res.json().get('invoiceHeaderList', [])
+        raw_invoices = query_res.json().get("invoiceHeaderList", [])
 
-        # 5. Pobieranie plików XML i parsowanie kwot
+        # 5. Pobieranie faktur XML
         parsed_invoices = []
         for item in raw_invoices:
-            ref = item['ksefReferenceNumber']
+            ref = item["ksefReferenceNumber"]
             inv_res = requests.get(
                 f"{base_url}/Invoice/Get/{ref}",
-                headers={"SessionToken": sess_token}
+                headers={"SessionToken": sess_token},
             )
-            
+
             if inv_res.status_code == 200:
                 inv_xml = inv_res.content
                 root = ET.fromstring(inv_xml)
-                
-                # Obsługa przestrzeni nazw XML
-                ns = {'fa': root.tag.split('}')[0].strip('{')} if '}' in root.tag else {}
-                ns_prefix = 'fa:' if ns else ''
 
-                seller_nip = root.findtext(f".//{ns_prefix}Podmiot1/{ns_prefix}DaneIdentyfikacyjne/{ns_prefix}NIP", default="Brak NIP", namespaces=ns)
-                net_val = float(root.findtext(f".//{ns_prefix}P_13_1", default="0.0", namespaces=ns) or 0.0)
-                vat_val = float(root.findtext(f".//{ns_prefix}P_14_1", default="0.0", namespaces=ns) or 0.0)
-                inv_date = root.findtext(f".//{ns_prefix}P_1", default=now.strftime("%Y-%m-%d"), namespaces=ns)
+                ns = (
+                    {"fa": root.tag.split("}")[0].strip("{")}
+                    if "}" in root.tag
+                    else {}
+                )
+                ns_prefix = "fa:" if ns else ""
 
-                parsed_invoices.append({
-                    "ksef_ref": ref,
-                    "date": inv_date,
-                    "seller_nip": seller_nip,
-                    "net": net_val,
-                    "vat": vat_val,
-                    "gross": net_val + vat_val
-                })
+                seller_nip = root.findtext(
+                    f".//{ns_prefix}Podmiot1/{ns_prefix}DaneIdentyfikacyjne/{ns_prefix}NIP",
+                    default="Brak NIP",
+                    namespaces=ns,
+                )
+                net_val = float(
+                    root.findtext(
+                        f".//{ns_prefix}P_13_1", default="0.0", namespaces=ns
+                    )
+                    or 0.0
+                )
+                vat_val = float(
+                    root.findtext(
+                        f".//{ns_prefix}P_14_1", default="0.0", namespaces=ns
+                    )
+                    or 0.0
+                )
+                inv_date = root.findtext(
+                    f".//{ns_prefix}P_1",
+                    default=now.strftime("%Y-%m-%d"),
+                    namespaces=ns,
+                )
+
+                parsed_invoices.append(
+                    {
+                        "ksef_ref": ref,
+                        "date": inv_date,
+                        "seller_nip": seller_nip,
+                        "net": net_val,
+                        "vat": vat_val,
+                        "gross": net_val + vat_val,
+                    }
+                )
 
         # Zamknięcie sesji
         requests.get(
             f"{base_url}/Session/Terminate",
-            headers={"SessionToken": sess_token}
+            headers={"SessionToken": sess_token},
         )
 
         return jsonify({"invoices": parsed_invoices})
